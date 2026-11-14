@@ -17,6 +17,7 @@ from .models import (
     ImpactResponse,
     RegisterRequest,
     RegisterResponse,
+    UndoResponse,
 )
 
 
@@ -31,9 +32,9 @@ app = FastAPI(
     title="数据血缘影响分析 API",
     description=(
         "批量登记源字段 / 派生字段 / 报表列依赖，提交拟下线字段后递归分析"
-        "确实失效的报表列及各候选组缺失依赖。"
+        "确实失效的报表列及各候选组缺失依赖；成功批次可按 batch_id 撤销。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -83,6 +84,22 @@ def health() -> dict:
 def register(payload: RegisterRequest) -> dict:
     """批量登记 / 覆盖血缘；循环依赖或校验失败时整批不生效。"""
     return service.register_batch(payload.nodes)
+
+
+@app.post(
+    "/lineage/batches/{batch_id}/undo",
+    response_model=UndoResponse,
+    tags=["lineage"],
+)
+def undo(batch_id: int) -> dict:
+    """按批次号撤销一批登记。
+
+    - 恢复该批覆盖字段的原定义；
+    - 删除该批新增且未被后续批次引用的字段；
+    - 若后续批次修改过这些字段或引用该批新增字段，返回 409 且血缘不变；
+    - 重复撤销返回首次成功结果。
+    """
+    return service.undo_batch(batch_id)
 
 
 @app.post(

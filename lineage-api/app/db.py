@@ -53,6 +53,33 @@ CREATE INDEX IF NOT EXISTS idx_inputs_group
     ON group_inputs(group_id);
 CREATE INDEX IF NOT EXISTS idx_inputs_name
     ON group_inputs(input_name);
+
+-- Undo log: one row per successfully committed registration batch.
+CREATE TABLE IF NOT EXISTS batches (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at  TEXT NOT NULL,
+    node_count  INTEGER NOT NULL,
+    undone      INTEGER NOT NULL DEFAULT 0 CHECK (undone IN (0, 1)),
+    -- JSON of the first successful undo response; repeated undos replay it.
+    undo_result TEXT
+);
+
+-- Pre-change snapshot for every field covered by a batch.
+-- ``old_*`` / ``new_*`` keep the definition immediately before / after the
+-- batch so a later batch can be detected as having rewritten the same field.
+CREATE TABLE IF NOT EXISTS batch_nodes (
+    batch_id    INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    node_name   TEXT NOT NULL,
+    existed     INTEGER NOT NULL CHECK (existed IN (0, 1)),
+    old_kind    TEXT,
+    old_groups  TEXT NOT NULL,
+    new_kind    TEXT NOT NULL,
+    new_groups  TEXT NOT NULL,
+    PRIMARY KEY (batch_id, node_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_batch_nodes_name
+    ON batch_nodes(node_name);
 """
 
 

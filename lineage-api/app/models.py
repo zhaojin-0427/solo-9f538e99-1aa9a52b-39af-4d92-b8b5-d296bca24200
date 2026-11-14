@@ -22,6 +22,7 @@ class RegisterRequest(BaseModel):
 
 
 class RegisterResponse(BaseModel):
+    batch_id: int = Field(..., description="登记批次号，可用于撤销")
     registered: int
     nodes: list[str]
     message: str
@@ -70,3 +71,13 @@ class NodeOut(BaseModel):
 class GraphResponse(BaseModel):
     nodes: list[NodeOut]
     counts: dict[str, int]
+
+
+class UndoResponse(BaseModel):
+    batch_id: int
+    undone: bool
+    restored: list[str] = Field(
+        description="恢复为登记前定义的字段（该批覆盖后又被撤销）"
+    )
+    deleted: list[str] = Field(description="该批新增、撤销后被删除的字段")
+    message: str

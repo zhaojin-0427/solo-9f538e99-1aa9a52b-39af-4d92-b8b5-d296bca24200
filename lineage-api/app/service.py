@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 
 from . import db
 from .exceptions import (
     ConflictLineageError,
     CycleDetectedError,
     NotFoundLineageError,
+    UndoConflictError,
     ValidationLineageError,
 )
 
@@ -110,6 +113,32 @@ def find_cycle(
 # Batch registration (all-or-nothing)
 # --------------------------------------------------------------------------- #
 
+def _replace_groups(
+    conn: sqlite3.Connection, node_name: str, groups: list[list[str]]
+) -> None:
+    """Rewrite one node's candidate groups from scratch."""
+    conn.execute(
+        "DELETE FROM group_inputs WHERE group_id IN "
+        "(SELECT id FROM candidate_groups WHERE node_name = ?)",
+        (node_name,),
+    )
+    conn.execute(
+        "DELETE FROM candidate_groups WHERE node_name = ?", (node_name,)
+    )
+    for pos, group in enumerate(groups):
+        cur = conn.execute(
+            "INSERT INTO candidate_groups(node_name, position) VALUES(?, ?)",
+            (node_name, pos),
+        )
+        gid = cur.lastrowid
+        for inp_pos, inp in enumerate(group):
+            conn.execute(
+                "INSERT INTO group_inputs(group_id, input_name, position) "
+                "VALUES(?, ?, ?)",
+                (gid, inp, inp_pos),
+            )
+
+
 def register_batch(
     payload_nodes: list, db_path: str | None = None
 ) -> dict:
@@ -196,6 +225,29 @@ def register_batch(
                 {"unknown_inputs": unknown},
             )
 
+        # ---- record pre-change definitions before writing anything ----
+        # Only fields covered by this batch are recorded; unrelated fields are
+        # untouched by the undo.
+        old_snapshot: dict[str, dict] = {}
+        for node in payload_nodes:
+            old_groups = conn.execute(
+                "SELECT id FROM candidate_groups WHERE node_name = ?",
+                (node.name,),
+            ).fetchall()
+            groups: list[list[str]] = []
+            for row in old_groups:
+                inputs = conn.execute(
+                    "SELECT input_name FROM group_inputs WHERE group_id = ? "
+                    "ORDER BY position",
+                    (row["id"],),
+                ).fetchall()
+                groups.append([r["input_name"] for r in inputs])
+            old_snapshot[node.name] = {
+                "existed": node.name in existing_kinds,
+                "kind": existing_kinds.get(node.name),
+                "groups": groups,
+            }
+
         # ---- upsert phase 1: all nodes must exist before any edge is written ----
         for node in payload_nodes:
             conn.execute(
@@ -207,30 +259,7 @@ def register_batch(
         # ---- upsert phase 2: replace candidate groups and their inputs ----
         for node in payload_nodes:
             # Replace all previously registered groups of this node.
-            old_groups = conn.execute(
-                "SELECT id FROM candidate_groups WHERE node_name = ?",
-                (node.name,),
-            ).fetchall()
-            for row in old_groups:
-                conn.execute(
-                    "DELETE FROM group_inputs WHERE group_id = ?", (row["id"],)
-                )
-            conn.execute(
-                "DELETE FROM candidate_groups WHERE node_name = ?", (node.name,)
-            )
-            for pos, group in enumerate(node.candidate_groups):
-                cur = conn.execute(
-                    "INSERT INTO candidate_groups(node_name, position) "
-                    "VALUES(?, ?)",
-                    (node.name, pos),
-                )
-                gid = cur.lastrowid
-                for inp_pos, inp in enumerate(group):
-                    conn.execute(
-                        "INSERT INTO group_inputs(group_id, input_name, "
-                        "position) VALUES(?, ?, ?)",
-                        (gid, inp, inp_pos),
-                    )
+            _replace_groups(conn, node.name, node.candidate_groups)
 
         # ---- whole-graph cycle check; roll back everything on a cycle ----
         kinds, groups = load_graph(conn)
@@ -241,11 +270,167 @@ def register_batch(
                 {"cycle": cycle},
             )
 
+        # ---- persist the undo record in the same transaction ----
+        cur = conn.execute(
+            "INSERT INTO batches(created_at, node_count) VALUES(?, ?)",
+            (
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                len(payload_nodes),
+            ),
+        )
+        batch_id = cur.lastrowid
+        for node in payload_nodes:
+            old = old_snapshot[node.name]
+            conn.execute(
+                "INSERT INTO batch_nodes(batch_id, node_name, existed, "
+                "old_kind, old_groups, new_kind, new_groups) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (
+                    batch_id,
+                    node.name,
+                    int(old["existed"]),
+                    old["kind"],
+                    json.dumps(old["groups"], ensure_ascii=False),
+                    node.kind,
+                    json.dumps(node.candidate_groups, ensure_ascii=False),
+                ),
+            )
+
     return {
+        "batch_id": batch_id,
         "registered": len(payload_nodes),
         "nodes": sorted(node.name for node in payload_nodes),
-        "message": "登记成功（已提交完整血缘快照）",
+        "message": "登记成功（已提交完整血缘快照，可按 batch_id 撤销）",
     }
+
+
+# --------------------------------------------------------------------------- #
+# Batch undo (all-or-nothing, guarded against later dependent batches)
+# --------------------------------------------------------------------------- #
+
+def undo_batch(batch_id: int, db_path: str | None = None) -> dict:
+    """Restore every field covered by ``batch_id`` to its pre-batch definition.
+
+    * Fields newly introduced by the batch are deleted (unless a later batch
+      still references them).
+    * Fields overwritten by the batch get their old kind / candidate groups.
+    * Fields outside the batch are never touched.
+    * If any covered field was redefined by a later batch, or a later batch
+      (still present) references a field this batch introduced, the undo is
+      rejected and the lineage is left unchanged.
+    * Repeating an undo replays the first successful result.
+    """
+    with db.immediate_write(db_path) as conn:
+        batch = conn.execute(
+            "SELECT id, undone, undo_result FROM batches WHERE id = ?",
+            (batch_id,),
+        ).fetchone()
+        if batch is None:
+            raise NotFoundLineageError(
+                "登记批次不存在", {"batch_id": batch_id}
+            )
+        if batch["undone"]:
+            # Idempotent: replay the exact first result.
+            return json.loads(batch["undo_result"])
+
+        rows = conn.execute(
+            "SELECT node_name, existed, old_kind, old_groups, "
+            "new_kind, new_groups FROM batch_nodes "
+            "WHERE batch_id = ? ORDER BY node_name",
+            (batch_id,),
+        ).fetchall()
+
+        kinds, groups = load_graph(conn)
+
+        # ---- guard 1: covered fields must still have this batch's definition ----
+        modified = sorted(
+            row["node_name"]
+            for row in rows
+            if kinds.get(row["node_name"]) != row["new_kind"]
+            or groups.get(row["node_name"], [])
+            != json.loads(row["new_groups"])
+        )
+        if modified:
+            raise UndoConflictError(
+                "字段定义已被后续批次修改，无法撤销该批次",
+                {"batch_id": batch_id, "modified_since_batch": modified},
+            )
+
+        # ---- guard 2: no surviving later reference to a newly added field ----
+        covered = {row["node_name"] for row in rows}
+        added = {
+            row["node_name"] for row in rows if not row["existed"]
+        }
+        if added:
+            referencing = sorted(
+                name
+                for name, node_groups in groups.items()
+                if name not in covered
+                and any(inp in added for g in node_groups for inp in g)
+            )
+            if referencing:
+                raise UndoConflictError(
+                    "该批新增字段仍被后续登记引用，无法撤销该批次",
+                    {
+                        "batch_id": batch_id,
+                        "added_fields": sorted(added),
+                        "referencing_nodes": referencing,
+                    },
+                )
+
+        # ---- apply the inverse, atomically ----
+        # Restore first: this drops every reference made by covered fields to
+        # nodes that the batch introduced, so the later deletes are safe.
+        restored: list[str] = []
+        deleted: list[str] = []
+        for row in rows:
+            if not row["existed"]:
+                continue
+            name = row["node_name"]
+            conn.execute(
+                "INSERT INTO nodes(name, kind) VALUES(?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET kind = excluded.kind",
+                (name, row["old_kind"]),
+            )
+            _replace_groups(conn, name, json.loads(row["old_groups"]))
+            restored.append(name)
+
+        for row in rows:
+            if row["existed"]:
+                continue
+            # Clear the deleted node's own outgoing edges first so pairs of
+            # batch-added nodes never block each other's removal.
+            _replace_groups(conn, row["node_name"], [])
+
+        for row in rows:
+            if row["existed"]:
+                continue
+            name = row["node_name"]
+            # Cascades remove any remaining inputs that still point here.
+            conn.execute("DELETE FROM nodes WHERE name = ?", (name,))
+            deleted.append(name)
+
+        # Defensive invariant: an undo must never leave a cyclic graph.
+        kinds, groups = load_graph(conn)
+        cycle = find_cycle(kinds, groups)
+        if cycle is not None:  # pragma: no cover - should be unreachable
+            raise CycleDetectedError(
+                "撤销将引入循环依赖，整批不生效",
+                {"cycle": cycle},
+            )
+
+        result = {
+            "batch_id": batch_id,
+            "undone": True,
+            "restored": sorted(restored),
+            "deleted": sorted(deleted),
+            "message": "批次已撤销，字段恢复为登记前定义",
+        }
+        conn.execute(
+            "UPDATE batches SET undone = 1, undo_result = ? WHERE id = ?",
+            (json.dumps(result, ensure_ascii=False), batch_id),
+        )
+        return result
 
 
 # --------------------------------------------------------------------------- #

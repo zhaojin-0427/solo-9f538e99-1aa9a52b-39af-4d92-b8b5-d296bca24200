@@ -28,3 +28,7 @@ class CycleDetectedError(ConflictLineageError):
 class NotFoundLineageError(LineageError):
     status_code = 404
     code = "not_found"
+
+
+class UndoConflictError(ConflictLineageError):
+    code = "undo_conflict"
